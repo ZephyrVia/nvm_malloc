@@ -1,6 +1,9 @@
 {
     "files.associations": {
         "nvmslab.h": "c",
-        "stdlib.h": "c"
+        "stdlib.h": "c",
+        "nvmdefs.h": "c",
+        "stdbool.h": "c",
+        "slabhashtable.h": "c"
     }
 }

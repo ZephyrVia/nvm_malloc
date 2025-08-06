@@ -1,6 +1,6 @@
 #include "unity.h"
-#include "nvm_slab.h"
-#include "nvm_slab.c"
+#include "NvmSlab.h"
+#include "NvmSlab.c"
 #include <stdlib.h>
 
 #define SIMULATED_NVM_SIZE (2 * 1024 * 1024) // 2MB
@@ -93,8 +93,6 @@ void test_nvm_slab_creation_and_destruction(void) {
     nvm_slab_destroy(slab);
 }
 
-
-// 这是修改后的、正确的测试函数
 
 /**
  * @brief 对 alloc/free 的缓存机制进行详尽的白盒测试。
@@ -327,14 +325,6 @@ void test_slab_behavior_with_various_sizes(void) {
     // 测试一个较大的尺寸
     RUN_TEST_CASE(SC_4K);
     
-    // 你可以添加更多的大小类进行测试
-    // RUN_TEST_CASE(SC_16B);
-    // RUN_TEST_CASE(SC_32B);
-    // RUN_TEST_CASE(SC_64B);
-    // RUN_TEST_CASE(SC_256B);
-    // RUN_TEST_CASE(SC_512B);
-    // RUN_TEST_CASE(SC_1K);
-    // RUN_TEST_CASE(SC_2K);
 }
 
 

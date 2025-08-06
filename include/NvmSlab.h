@@ -1,15 +1,12 @@
 #ifndef NVM_SLAB_H
 #define NVM_SLAB_H
 
-#include <stdint.h>   // 用于 uint_t 系列类型
-#include <stddef.h>   // 用于 size_t (良好的编程习惯)
-#include <stdbool.h>  // 用于 bool 类型 (true, false)
+#include <stdbool.h>
 
+#include "NvmDefs.h"
 
-#define SLAB_TOTAL_SIZE       (2 * 1024 * 1024) // 2MB
-#define SLAB_CACHE_SIZE       64
+#define SLAB_CACHE_SIZE (64)
 #define SLAB_CACHE_BATCH_SIZE (SLAB_CACHE_SIZE / 2)
-
 
 typedef struct NvmSlab {
 
@@ -50,25 +47,6 @@ typedef struct NvmSlab {
     unsigned char bitmap[];
 
 } NvmSlab;
-
-
-/**
- * @brief 定义了不同类型的 Slab，主要根据其管理的块大小来划分。
- *        这些ID将作为上层管理器中大小类数组的索引。
- */
-typedef enum {
-    SC_8B,       // 8字节
-    SC_16B,      // 16字节
-    SC_32B,      // 32字节
-    SC_64B,      // 64字节
-    SC_128B,     // 128字节
-    SC_256B,     // 256字节
-    SC_512B,     // 512字节
-    SC_1K,       // 1024字节
-    SC_2K,       // 2048字节
-    SC_4K,       // 4096字节
-    SC_COUNT     // 特殊成员，自动表示大小类的总数
-} SizeClassID;
 
 
 
