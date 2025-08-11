@@ -18,14 +18,20 @@ static void remove_slab_from_list(NvmSlab** list_head, NvmSlab* slab_to_remove);
 //                          公共 API 函数实现
 // ============================================================================
 
-NvmAllocator* nvm_allocator_create(uint64_t total_nvm_size, uint64_t nvm_start_offset) {
+NvmAllocator* nvm_allocator_create(void* nvm_base_addr, uint64_t nvm_size_bytes) {
+
+    if(nvm_base_addr == NULL)
+        return NULL;
+
     NvmAllocator* allocator = (NvmAllocator*)malloc(sizeof(NvmAllocator));
     if (allocator == NULL) {
         return NULL;
     }
 
+    allocator->nvm_base_addr = nvm_base_addr;
+
     // 创建底层组件
-    allocator->space_manager = space_manager_create(total_nvm_size, nvm_start_offset);
+    allocator->space_manager = space_manager_create(nvm_size_bytes, DEFAULT_NVM_START_OFFSET);
     allocator->slab_lookup_table = slab_hashtable_create(INITIAL_HASHTABLE_CAPACITY);
 
     // 任一组件创建失败，则清理并返回NULL
@@ -43,6 +49,7 @@ NvmAllocator* nvm_allocator_create(uint64_t total_nvm_size, uint64_t nvm_start_o
 
     return allocator;
 }
+
 
 void nvm_allocator_destroy(NvmAllocator* allocator) {
     if (allocator == NULL) {
@@ -67,16 +74,16 @@ void nvm_allocator_destroy(NvmAllocator* allocator) {
     free(allocator);
 }
 
-uint64_t nvm_malloc(NvmAllocator* allocator, size_t size) {
+void* nvm_malloc(NvmAllocator* allocator, size_t size) {
     if (allocator == NULL || size == 0) {
-        return (uint64_t)-1;
+        return NULL;
     }
 
     // 映射请求大小到尺寸类别
     SizeClassID sc_id = map_size_to_sc_id(size);
     if (sc_id == SC_COUNT) {
         // TODO: 为大对象增加直接分配逻辑
-        return (uint64_t)-1;
+        return NULL;
     }
 
     // 在对应链表中查找有空闲空间的Slab
@@ -89,13 +96,13 @@ uint64_t nvm_malloc(NvmAllocator* allocator, size_t size) {
     if (target_slab == NULL) {
         uint64_t new_slab_offset = space_manager_alloc_slab(allocator->space_manager);
         if (new_slab_offset == (uint64_t)-1) {
-            return (uint64_t)-1; // NVM空间耗尽
+            return NULL; // NVM空间耗尽
         }
 
         target_slab = nvm_slab_create(sc_id, new_slab_offset);
         if (target_slab == NULL) {
             space_manager_free_slab(allocator->space_manager, new_slab_offset); // DRAM不足，归还NVM空间
-            return (uint64_t)-1;
+            return NULL;
         }
 
         // 注册新Slab并加入链表头部
@@ -107,16 +114,19 @@ uint64_t nvm_malloc(NvmAllocator* allocator, size_t size) {
     // 从Slab中分配一个块
     uint32_t block_idx;
     if (nvm_slab_alloc(target_slab, &block_idx) == 0) {
-        return target_slab->nvm_base_offset + (block_idx * target_slab->block_size);
+        uint64_t final_offset = target_slab->nvm_base_offset + (block_idx * target_slab->block_size);
+        return (void*)((char*)allocator->nvm_base_addr + final_offset);
     }
 
-    return (uint64_t)-1; // 理论上不应发生
+    return NULL; // 理论上不应发生
 }
 
-void nvm_free(NvmAllocator* allocator, uint64_t nvm_offset) {
-    if (allocator == NULL || nvm_offset == (uint64_t)-1) {
+void nvm_free(NvmAllocator* allocator, void* nvm_ptr) {
+    if (allocator == NULL || nvm_ptr == NULL) {
         return;
     }
+
+    uint64_t nvm_offset = (uint64_t)((char*)nvm_ptr - (char*)allocator->nvm_base_addr);
 
     // 根据地址计算Slab基地址
     uint64_t slab_base_offset = (nvm_offset / NVM_SLAB_SIZE) * NVM_SLAB_SIZE;
@@ -188,12 +198,13 @@ static void remove_slab_from_list(NvmSlab** list_head, NvmSlab* slab_to_remove) 
     }
 }
 
-
-uint64_t nvm_allocator_restore_allocation(NvmAllocator* allocator, uint64_t nvm_offset, size_t size) {
-    if (allocator == NULL || size == 0) return (uint64_t)-1;
+int nvm_allocator_restore_allocation(NvmAllocator* allocator, void* nvm_ptr, size_t size) {
+    if (allocator == NULL || nvm_ptr == NULL || size == 0) return -1;
 
     SizeClassID sc_id = map_size_to_sc_id(size);
-    if (sc_id == SC_COUNT) return (uint64_t)-1;
+    if (sc_id == SC_COUNT) return -1;
+
+     uint64_t nvm_offset = (uint64_t)((char*)nvm_ptr - (char*)allocator->nvm_base_addr);
 
     uint64_t slab_base_offset = (nvm_offset / NVM_SLAB_SIZE) * NVM_SLAB_SIZE;
 
@@ -206,7 +217,7 @@ uint64_t nvm_allocator_restore_allocation(NvmAllocator* allocator, uint64_t nvm_
         target_slab = nvm_slab_create(sc_id, slab_base_offset);
         if (target_slab == NULL) {
             space_manager_free_slab(allocator->space_manager, slab_base_offset); // 回滚
-            return (uint64_t)-1;
+            return -1;
         }
 
         // 注册并链接新 Slab
@@ -216,13 +227,13 @@ uint64_t nvm_allocator_restore_allocation(NvmAllocator* allocator, uint64_t nvm_
         
     } else {
         // Slab 已存在: 检查尺寸类别是否一致
-        if (target_slab->size_type_id != sc_id) return (uint64_t)-1;
+        if (target_slab->size_type_id != sc_id) return -1;
     }
 
     // 在Slab内标记此块为已分配
     uint32_t block_idx = (nvm_offset - slab_base_offset) / target_slab->block_size;
-    if (nvm_slab_set_bitmap_at_idx(target_slab, block_idx) != 0) return (uint64_t)-1;
+    if (nvm_slab_set_bitmap_at_idx(target_slab, block_idx) != 0) return -1;
 
-    return nvm_offset;
+    return 0;
 }
 

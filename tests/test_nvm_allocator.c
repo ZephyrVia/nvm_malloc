@@ -20,10 +20,22 @@
 #define TOTAL_NVM_SIZE (10 * NVM_SLAB_SIZE) // 20MB，足够容纳10个Slab
 #define NUM_SLABS 10
 
-// 由于每个测试都会创建和销毁自己的分配器实例，因此这些函数可以为空。
-void setUp(void) {}
-void tearDown(void) {}
+static void* mock_nvm_base = NULL;
 
+// 由于每个测试都会创建和销毁自己的分配器实例，因此这些函数可以为空。
+void setUp(void) {
+    // 为每个测试分配一块干净的模拟NVM内存
+    mock_nvm_base = malloc(TOTAL_NVM_SIZE);
+    TEST_ASSERT_NOT_NULL(mock_nvm_base);
+    // 可选：清零内存以确保测试的可重复性
+    memset(mock_nvm_base, 0, TOTAL_NVM_SIZE);
+}
+
+void tearDown(void) {
+    // 释放模拟NVM内存
+    free(mock_nvm_base);
+    mock_nvm_base = NULL;
+}
 // ============================================================================
 //                          测试用例
 // ============================================================================
@@ -33,10 +45,11 @@ void tearDown(void) {}
  */
 void test_allocator_lifecycle(void) {
     // --- 子测试 1: 正常创建 ---
-    NvmAllocator* allocator = nvm_allocator_create(TOTAL_NVM_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, TOTAL_NVM_SIZE);
     TEST_ASSERT_NOT_NULL(allocator);
 
     // 白盒检查: 确认所有内部组件都已正确初始化
+    TEST_ASSERT_EQUAL_PTR(mock_nvm_base, allocator->nvm_base_addr);
     TEST_ASSERT_NOT_NULL(allocator->space_manager);
     TEST_ASSERT_NOT_NULL(allocator->slab_lookup_table);
     TEST_ASSERT_EQUAL_UINT64(TOTAL_NVM_SIZE, allocator->space_manager->head->size); // 确认空间管理器有初始空间
@@ -47,7 +60,7 @@ void test_allocator_lifecycle(void) {
     nvm_allocator_destroy(allocator);
 
     // --- 子测试 2: 无效参数创建 ---
-    allocator = nvm_allocator_create(NVM_SLAB_SIZE - 1, 0);
+    allocator = nvm_allocator_create(NULL, TOTAL_NVM_SIZE);
     TEST_ASSERT_NULL(allocator);
 
     // --- 子测试 3: 销毁 NULL 指针 ---
@@ -58,11 +71,11 @@ void test_allocator_lifecycle(void) {
  * @brief 测试基本的 malloc/free 和内部状态变化。
  */
 void test_basic_malloc_and_free(void) {
-    NvmAllocator* allocator = nvm_allocator_create(TOTAL_NVM_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, TOTAL_NVM_SIZE);
     
     // --- 子测试 1: 首次分配 (应创建新Slab) ---
-    uint64_t offset = nvm_malloc(allocator, 30); // 应使用 SC_32B
-    TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offset);
+    void* ptr = nvm_malloc(allocator, 30); // 应使用 SC_32B
+    TEST_ASSERT_NOT_NULL(ptr);
     
     // 白盒检查:
     TEST_ASSERT_NOT_NULL(allocator->slab_lists[SC_32B]); // 32B slab链表应非空
@@ -71,7 +84,7 @@ void test_basic_malloc_and_free(void) {
     TEST_ASSERT_EQUAL_UINT64((NUM_SLABS - 1) * NVM_SLAB_SIZE, allocator->space_manager->head->size);
 
     // --- 子测试 2: 释放 ---
-    nvm_free(allocator, offset);
+    nvm_free(allocator, ptr);
     // 此时slab应未被回收，因为它是该尺寸的唯一一个
     TEST_ASSERT_NOT_NULL(allocator->slab_lists[SC_32B]);
     TEST_ASSERT_TRUE(nvm_slab_is_empty(allocator->slab_lists[SC_32B]));
@@ -83,24 +96,24 @@ void test_basic_malloc_and_free(void) {
  * @brief 测试Slab的创建和复用逻辑。
  */
 void test_slab_creation_and_reuse(void) {
-    NvmAllocator* allocator = nvm_allocator_create(TOTAL_NVM_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, TOTAL_NVM_SIZE);
 
     // 1. 分配一个 60 字节的对象，应创建 SC_64B 的Slab
-    uint64_t offset1 = nvm_malloc(allocator, 60);
-    TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offset1);
+    void* ptr1 = nvm_malloc(allocator, 60);
+    TEST_ASSERT_NOT_NULL(ptr1);
     NvmSlab* slab64_ptr = allocator->slab_lists[SC_64B];
     TEST_ASSERT_NOT_NULL(slab64_ptr);
     TEST_ASSERT_EQUAL_UINT32(1, allocator->slab_lookup_table->count);
 
     // 2. 再次分配 60 字节，应复用同一个Slab
-    uint64_t offset2 = nvm_malloc(allocator, 60);
-    TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offset2);
+    void* ptr2 = nvm_malloc(allocator, 60);
+    TEST_ASSERT_NOT_NULL(ptr2);
     TEST_ASSERT_EQUAL_PTR(slab64_ptr, allocator->slab_lists[SC_64B]); // 确认头指针没变
     TEST_ASSERT_EQUAL_UINT32(1, allocator->slab_lookup_table->count); // 确认哈希表数量没变
 
     // 3. 分配一个不同尺寸的对象 (8字节)，应创建新的Slab
-    uint64_t offset3 = nvm_malloc(allocator, 8);
-    TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offset3);
+    void* ptr3 = nvm_malloc(allocator, 8);
+    TEST_ASSERT_NOT_NULL(ptr3);
     TEST_ASSERT_NOT_NULL(allocator->slab_lists[SC_8B]);
     TEST_ASSERT_EQUAL_UINT32(2, allocator->slab_lookup_table->count); // 哈希表数量应变为2
 
@@ -111,7 +124,8 @@ void test_slab_creation_and_reuse(void) {
  * @brief 测试空Slab被回收的核心逻辑。
  */
 void test_empty_slab_recycling(void) {
-    NvmAllocator* allocator = nvm_allocator_create(TOTAL_NVM_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, TOTAL_NVM_SIZE);
+    TEST_ASSERT_NOT_NULL(allocator);
 
     // --- 1. 创建两个同尺寸的Slab ---
     size_t alloc_size = 128;
@@ -119,19 +133,18 @@ void test_empty_slab_recycling(void) {
     uint32_t blocks_per_slab = NVM_SLAB_SIZE / alloc_size;
 
     // 分配并填满第一个Slab
-    uint64_t* offsets = malloc(sizeof(uint64_t) * (blocks_per_slab + 1));
+    void** ptrs = malloc(sizeof(void*) * (blocks_per_slab + 1));
     for (uint32_t i = 0; i < blocks_per_slab; ++i) {
-        offsets[i] = nvm_malloc(allocator, alloc_size);
-        TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offsets[i]);
+        ptrs[i] = nvm_malloc(allocator, alloc_size);
+        TEST_ASSERT_NOT_NULL(ptrs[i]);
     }
     
     // 白盒检查: 此时应只有一个SC_128B的Slab
     TEST_ASSERT_NOT_NULL(allocator->slab_lists[sc_id]);
     TEST_ASSERT_NULL(allocator->slab_lists[sc_id]->next_in_chain);
 
-    // 再分配一个，强制创建第二个Slab
-    offsets[blocks_per_slab] = nvm_malloc(allocator, alloc_size);
-    TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offsets[blocks_per_slab]);
+    ptrs[blocks_per_slab] = nvm_malloc(allocator, alloc_size);
+    TEST_ASSERT_NOT_NULL(ptrs[blocks_per_slab]);
     
     // 白盒检查: 此时应有两个SC_128B的Slab
     TEST_ASSERT_NOT_NULL(allocator->slab_lists[sc_id]);
@@ -141,7 +154,7 @@ void test_empty_slab_recycling(void) {
     // --- 2. 释放并回收第一个Slab ---
     // 释放第一个Slab的所有块
     for (uint32_t i = 0; i < blocks_per_slab; ++i) {
-        nvm_free(allocator, offsets[i]);
+        nvm_free(allocator, ptrs[i]);
     }
 
     // 白盒检查: 第一个Slab应已被回收
@@ -151,7 +164,7 @@ void test_empty_slab_recycling(void) {
     TEST_ASSERT_EQUAL_UINT32(1, allocator->slab_lookup_table->count); // 哈希表也应只有一个条目
     
     // --- 3. 释放最后一个Slab，但不回收 ---
-    nvm_free(allocator, offsets[blocks_per_slab]);
+    nvm_free(allocator, ptrs[blocks_per_slab]);
     
     // 白盒检查: 最后一个Slab变空了，但不应被回收
     TEST_ASSERT_NOT_NULL(allocator->slab_lists[sc_id]);
@@ -160,37 +173,39 @@ void test_empty_slab_recycling(void) {
     TEST_ASSERT_TRUE(nvm_slab_is_empty(allocator->slab_lists[sc_id])); // 确认它确实是空的
 
     // 清理
-    free(offsets);
+    free(ptrs);
     nvm_allocator_destroy(allocator);
 }
 
 void test_parameter_and_error_handling(void) {
-    NvmAllocator* allocator = nvm_allocator_create(TOTAL_NVM_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, TOTAL_NVM_SIZE);
+    TEST_ASSERT_NOT_NULL(allocator);
 
     // 1. 测试分配大小为 0
-    uint64_t offset = nvm_malloc(allocator, 0);
-    TEST_ASSERT_EQUAL_UINT64((uint64_t)-1, offset);
+    void* ptr = nvm_malloc(allocator, 0);
+    TEST_ASSERT_NULL(ptr);
 
     // 2. 测试分配大小超过最大Slab块 (4K)
-    offset = nvm_malloc(allocator, 4097); // 4096 is max block size
-    TEST_ASSERT_EQUAL_UINT64((uint64_t)-1, offset);
-
+    ptr = nvm_malloc(allocator, 4097);
+    TEST_ASSERT_NULL(ptr);
     // 3. 测试释放一个无效的地址 (不在任何Slab范围内)
-    //    注意：这会触发 assert! 所以这个测试只能在Debug模式下运行，
-    //    并且通常我们会把它放在一个单独的、预期会失败的测试集中。
-    //    在常规测试中，我们只需确认调用不会导致崩溃。
-    // nvm_free(allocator, TOTAL_NVM_SIZE + 100); // An address far outside our managed space
+    //    ... (注释内容保持不变) ...
+    // MODIFIED: 更新了示例以使用指针，而不是偏移量
+    // nvm_free(allocator, (void*)((char*)mock_nvm_base + TOTAL_NVM_SIZE + 100));
 
-    // 4. 测试释放 NULL 或 -1
-    // nvm_free(allocator, 0);
-    nvm_free(allocator, (uint64_t)-1);
+    // 4. 测试释放 NULL 指针
+    // REPLACED: 测试释放 (uint64_t)-1 不再有意义。
+    //           根据C标准，free(NULL)是安全无操作的，我们的 nvm_free 也应如此。
+    nvm_free(allocator, NULL);
     
     nvm_allocator_destroy(allocator);
 }
 
 void test_nvm_space_exhaustion(void) {
+
+    const size_t small_nvm_size = 2 * NVM_SLAB_SIZE;
     // 只创建一个能容纳2个Slab的空间
-    NvmAllocator* allocator = nvm_allocator_create(2 * NVM_SLAB_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, small_nvm_size);
 
     // 创建并填满 slab1 (SC_8B)
     for (int i = 0; i < NVM_SLAB_SIZE / 8; ++i) {
@@ -206,40 +221,43 @@ void test_nvm_space_exhaustion(void) {
     TEST_ASSERT_NULL(allocator->space_manager->head);
 
     // 此时再请求一个不同尺寸的内存，需要创建新Slab，但底层空间已无
-    uint64_t offset = nvm_malloc(allocator, 32);
-    TEST_ASSERT_EQUAL_UINT64((uint64_t)-1, offset);
+    void* ptr = nvm_malloc(allocator, 32);
+    TEST_ASSERT_NULL(ptr);
 
     nvm_allocator_destroy(allocator);
 }
 
 void test_mixed_load_and_fragmentation(void) {
-    NvmAllocator* allocator = nvm_allocator_create(TOTAL_NVM_SIZE, 0);
+    NvmAllocator* allocator = nvm_allocator_create(mock_nvm_base, TOTAL_NVM_SIZE);
+    TEST_ASSERT_NOT_NULL(allocator);
+
     const int num_allocs = 1000;
-    uint64_t* offsets = malloc(sizeof(uint64_t) * num_allocs);
+    void** ptrs = malloc(sizeof(void*) * num_allocs);
+    // NEW: 增加断言确保测试辅助内存分配成功
+    TEST_ASSERT_NOT_NULL(ptrs);
 
     // 阶段1: 大量不同尺寸的分配
     for (int i = 0; i < num_allocs; ++i) {
         // (i % 100 + 1) 会产生 1-100 字节的随机大小请求
-        offsets[i] = nvm_malloc(allocator, (i % 100) + 1);
-        TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offsets[i]);
+        ptrs[i] = nvm_malloc(allocator, (i % 100) + 1);
+        TEST_ASSERT_NOT_NULL(ptrs[i]);
     }
 
     // 阶段2: 交错释放 (比如释放所有偶数索引的块)
     for (int i = 0; i < num_allocs; i += 2) {
-        nvm_free(allocator, offsets[i]);
-        offsets[i] = (uint64_t)-1; // 标记为已释放
+        nvm_free(allocator, ptrs[i]);
+        ptrs[i] = NULL;
     }
 
     // 阶段3: 再次分配，验证空间能否被复用
     for (int i = 0; i < num_allocs / 2; ++i) {
-        uint64_t offset = nvm_malloc(allocator, (i % 50) + 1);
-        TEST_ASSERT_NOT_EQUAL((uint64_t)-1, offset);
+        void* ptr = nvm_malloc(allocator, (i % 50) + 1);
+        TEST_ASSERT_NOT_NULL(ptr);
     }
     
-    free(offsets);
+    free(ptrs);
     nvm_allocator_destroy(allocator);
 }
-
 
 // ============================================================================
 //                          测试执行入口
