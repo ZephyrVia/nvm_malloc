@@ -1,150 +1,103 @@
+# NvmMalloc: 高性能并行 NVM 分配器
 
-# NVM 分配器并行化改造指南 (OSAL 抽象层 + 核心逻辑分离)
+**NvmMalloc** 是一个专为非易失性内存 (NVM) 设计的高性能、并发安全的内存分配器。它采用 **Slab 分配算法** 结合 **Per-CPU 缓存** 架构，显著降低了多线程环境下的锁竞争，并针对 RTEMS 实时操作系统和 Linux 环境进行了深度优化。
 
-## 第一步：构建操作系统抽象层 (OSAL)
-在触碰任何核心分配逻辑之前，必须先建立一层薄薄的抽象层。这层抽象决定了“锁是什么”以及“我是谁（哪个CPU）”。
+## 🚀 核心特性
 
-**目标**：隔离 Linux 与 RTEMS 的差异，确保核心代码只调用统一的宏或接口。
+*   **高性能并发架构**：
+    *   **Per-CPU Heap (L1)**：每个 CPU 独享本地 Slab 链表，实现**无锁分配 (Lock-free Fast Path)**。
+    *   **Central Heap (L2)**：全局共享堆，负责大块内存管理和元数据索引，处理本地缓存未命中场景。
+*   **细粒度锁策略**：
+    *   **Slab**：内部集成自旋锁 (Spinlock) 保护位图，支持安全的跨线程释放 (Remote Free)。
+    *   **哈希表**：使用读写锁 (RWLock) 优化全局元数据查找。
+    *   **空间管理**：使用互斥锁 (Mutex) 保护 NVM 物理地址空间的切割与合并。
+*   **缓存友好**：
+    *   关键数据结构强制对齐到缓存行 (64B/128B)，彻底消除**伪共享 (False Sharing)**。
+*   **跨平台支持**：
+    *   内建 OSAL (操作系统抽象层)，无缝支持 Linux 和 RTEMS。
 
-1.  **定义并发配置头文件**：
-    *   新建一个配置头文件（如 `NvmConfig.h` 或在 `NvmDefs.h` 中）。
-    *   定义系统的 `MAX_CPUS`（最大核心数）。在 Linux 下可以设大一点（如 64 或 128），在 RTEMS 下根据板级支持包（BSP）设定。
+## 🏗️ 架构概览
 
-2.  **封装 CPU ID 获取逻辑**：
-    *   定义一个宏或内联函数 `NVM_GET_CURRENT_CPU_ID()`。
-    *   **Linux 实现**：调用 `sched_getcpu()`。
-    *   **RTEMS 实现**：预留接口调用 `rtems_scheduler_get_processor()`。
-    *   **逻辑保证**：返回值必须在 `0` 到 `MAX_CPUS - 1` 之间。
+```text
+[ Application Layer ]
+      | nvm_malloc / nvm_free
+      v
++--------------------------+       +--------------------------+
+|     Per-CPU Heap (0)     |  ...  |     Per-CPU Heap (N)     |
+|  [Slab Cache] [No Lock]  |       |  [Slab Cache] [No Lock]  |
++------------+-------------+       +-------------+------------+
+             | (Refill / Flush)                  |
+             v                                   v
++-------------------------------------------------------------+
+|                        Central Heap                         |
+|   [SpaceManager (Mutex)]      [SlabHashTable (RWLock)]      |
++-------------------------------------------------------------+
+             |
+             v
+[          Physical NVM Memory Space (Raw Block)              ]
+```
 
-3.  **封装互斥锁/自旋锁**：
-    *   定义 `nvm_lock_t` 类型。
-    *   定义 `NVM_LOCK_INIT(lock)`。
-    *   定义 `NVM_LOCK_ACQUIRE(lock)`。
-    *   定义 `NVM_LOCK_RELEASE(lock)`。
-    *   **策略**：
-        *   对于 **Slab 内部锁**（持有时间极短）：推荐使用自旋锁（Linux `pthread_spin_lock` / RTEMS 自旋锁），因为它避免了线程调度的开销。
-        *   对于 **中心堆锁**（可能涉及页表操作，持有时间稍长）：推荐使用互斥锁（Mutex）。
+## 📂 目录结构
 
----
+*   `include/`: 头文件与 API 接口
+    *   `NvmAllocator.h`: 用户公共 API
+    *   `NvmConfig.h`: 平台配置与 OSAL
+*   `src/`: 核心实现
+    *   `NvmAllocator.c`: 分配器入口与分层逻辑
+    *   `NvmSlab.c`: Slab 元数据管理
+    *   `NvmSpaceManager.c`: NVM 物理空间管理 (First-Fit)
+    *   `SlabHashTable.c`: 全局元数据索引
+*   `tests/`: 单元测试与压力测试
 
-## 第二步：数据结构的物理拆分
-现在的 `NvmAllocator` 是一个上帝对象（God Object），包含所有资源。我们需要将其拆解为“共享资源”和“独占资源”。
+## 🛠️ 构建与测试
 
-**目标**：消除单一结构体对并发的限制。
+### 依赖环境
 
-1.  **定义 `NvmCentralHeap`（中心堆）**：
-    *   这是所有 CPU 共享的资源。
-    *   **移入成员**：
-        *   `SpaceManager`：负责大块 NVM 空间的切分。
-        *   `SlabHashTable`：负责地址到元数据的全局查找。
-        *   `nvm_base_addr`：NVM 基地址。
-        *   **新增成员**：一把**中心大锁**，保护上述所有结构的操作。
+*   CMake >= 3.10
+*   GCC / Clang
+*   Pthreads 库
 
-2.  **定义 `NvmCpuHeap`（CPU 独占堆）**：
-    *   这是每个 CPU 独立拥有的缓存。
-    *   **移入成员**：
-        *   `slab_lists[SC_COUNT]`：原先在分配器里的链表数组，现在下沉到这里。
-    *   **注意**：这个结构体**不需要**锁，因为按照设计，只有当前的 CPU 能够访问它（除非涉及从其他 CPU 偷取任务，但第一阶段暂不考虑）。
+### 编译项目
 
-3.  **重构主句柄 `NvmAllocator`**：
-    *   它不再直接管理内存，而是作为容器。
-    *   包含一个 `NvmCentralHeap` 实例。
-    *   包含一个 `NvmCpuHeap` 的数组，大小为 `MAX_CPUS`。
+```bash
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make
+```
 
----
+### 运行测试
 
-## 第三步：增强 Slab 元数据的线程安全性
-Slab 是并发冲突的最前线。虽然 CPU A 可能创建并拥有某个 Slab，但 CPU B 可能会释放属于该 Slab 的内存块。
+1. **逻辑验证测试**：
+   验证分配、释放、数据完整性及跨线程释放逻辑。
 
-**目标**：保证 Slab 内部状态（位图、缓存索引）的一致性。
+   ```bash
+   ./bin/test_nvm_allocator
+   ```
 
-1.  **修改 `NvmSlab` 结构体**：
-    *   新增一个细粒度的锁成员（使用 OSAL 定义的类型）。
+2. **多线程压力测试**：
+   高并发混合读写测试。
+   *注：Linux 下若开启 TSan 检测，建议禁用 ASLR 以避免内存映射冲突。*
 
-2.  **修改生命周期函数**：
-    *   在 `create` 时初始化这把锁。
-    *   在 `destroy` 时销毁这把锁。
+   ```bash
+   setarch $(uname -m) -R ./bin/test_nvm_multithread
+   ```
 
-3.  **修改核心操作**：
-    *   在 `nvm_slab_alloc` 内部：进入函数即加锁，操作位图/缓存，退出前解锁。
-    *   在 `nvm_slab_free` 内部：进入函数即加锁，操作位图/缓存，退出前解锁。
-    *   **重要**：这一步修改保证了无论谁调用 Slab 的接口，其内部数据都不会错乱。
+## 🔌 API 接口
 
----
+```c
+// 初始化分配器 (管理指定范围的 NVM 空间)
+int nvm_allocator_create(void* nvm_base_addr, uint64_t nvm_size_bytes);
 
-## 第四步：重构 `nvm_malloc` —— 实现两级分配路径
-这是并行化改造的核心逻辑。
+// 销毁分配器
+void nvm_allocator_destroy();
 
-**目标**：优先在无锁的 CPU 本地堆分配，失败后再去有锁的中心堆。
+// 分配内存
+void* nvm_malloc(size_t size);
 
-1.  **获取上下文**：
-    *   调用 `NVM_GET_CURRENT_CPU_ID()` 获取当前 ID。
-    *   利用 ID 索引 `NvmAllocator` 中的数组，拿到当前的 `NvmCpuHeap` 指针。
+// 释放内存
+void nvm_free(void* nvm_ptr);
 
-2.  **快速路径（Fast Path - 本地）**：
-    *   根据申请大小计算 `SC_ID`（尺寸类别）。
-    *   访问 `NvmCpuHeap` 中的 `slab_lists[SC_ID]`。
-    *   检查链表头部的 Slab 是否有空位。
-    *   如果有，调用 `nvm_slab_alloc`（注意：Slab 内部有锁，所以这里是安全的）。
+// [故障恢复] 恢复已分配块的元数据状态
+int nvm_allocator_restore_allocation(void* nvm_ptr, size_t size);
+```
 
-3.  **慢速路径（Slow Path - 中心）**：
-    *   如果本地链表为空，或所有 Slab 都满了。
-    *   **获取中心堆大锁**。
-    *   操作 `SpaceManager` 申请新的大块 NVM。
-    *   创建新的 `NvmSlab` 元数据。
-    *   将新 Slab 注册到全局 `SlabHashTable`。
-    *   **释放中心堆大锁**。
-    *   将新 Slab 挂载到当前 `NvmCpuHeap` 的链表头部。
-    *   执行分配。
-
----
-
-## 第五步：重构 `nvm_free` —— 解决远程释放问题
-`free` 操作无法像 `malloc` 那样利用 CPU 本地堆，因为你只能根据地址去查它属于哪个 Slab。
-
-**目标**：安全地找到并归还内存块，处理潜在的资源回收。
-
-1.  **全局查找**：
-    *   根据传入指针计算 Offset。
-    *   **获取中心堆大锁**（为了读哈希表）。
-    *   在 `SlabHashTable` 中查找对应的 Slab 指针。
-    *   **释放中心堆大锁**。
-    *   *注*：这是并发瓶颈点，但为了保证接口不变，必须这么做。后续优化可改用无锁哈希或页表元数据索引。
-
-2.  **执行释放**：
-    *   调用 `nvm_slab_free(slab, idx)`。由于第三步已加锁，这里是线程安全的。
-
-3.  **Slab 回收策略调整**：
-    *   在单线程版本中，Slab 空了会立即销毁。
-    *   在多线程版本中，建议**暂时移除“空即销毁”的逻辑**。
-    *   **原因**：Slab 可能属于 CPU A 的链表，但当前是 CPU B 在执行释放。如果 CPU B 销毁了 Slab，它需要去操作 CPU A 的链表将其摘除，这需要极其复杂的锁机制。
-    *   **策略**：允许空的 Slab 暂时存活。等待 CPU A 下次分配内存遍历链表时，发现它是空的再复用，或者由专门的清理线程回收。这是最简单的“最小改造”。
-
----
-
-## 第六步：初始化与销毁的适配
-最后一步是确保系统启动和关闭时的资源管理。
-
-1.  **初始化 (`create`)**：
-    *   初始化 `NvmCentralHeap` 的锁和组件。
-    *   为 `NvmCpuHeap` 数组分配内存（如果是动态分配）。
-    *   不需要为每个 CPU Heap 初始化锁，因为它们是无锁的。
-
-2.  **销毁 (`destroy`)**：
-    *   这步比较麻烦，因为 Slab 分散在各个 CPU 的链表中。
-    *   **策略**：不再遍历 CPU 的链表。直接遍历全局 `SlabHashTable`（因为它记录了所有的 Slab）。
-    *   遍历哈希表，销毁每一个 Slab。
-    *   最后销毁中心堆组件。
-
----
-
-### 总结
-按照这个顺序，你可以一步步将单线程逻辑替换为多线程逻辑：
-1.  **OSAL** (屏蔽底层差异)
-2.  **Split Structs** (拆分全局/局部数据)
-3.  **Lock Slab** (保护最小单元)
-4.  **Malloc Flow** (先本地后全局)
-5.  **Free Flow** (查全局还局部)
-6.  **Lifecycle** (全局清理)
-
-这种方式对现有代码侵入性最小，且逻辑上完全解耦了 Linux 和 RTEMS 的具体实现。
