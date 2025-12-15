@@ -10,10 +10,10 @@
 // 1. 中心堆 (Central Heap)
 // 所有 CPU 共享的资源，必须加锁保护
 typedef struct NvmCentralHeap {
-    void*             nvm_base_addr;     // NVM 基地址
-    FreeSpaceManager* space_manager;     // 大块内存管理器
-    SlabHashTable*    slab_lookup_table; // 全局 Slab 查找表
-    nvm_mutex_t       global_lock;       // 中心大锁
+    void*             nvm_base_addr;
+    
+    FreeSpaceManager* space_manager;
+    SlabHashTable*    slab_lookup_table;
 } NvmCentralHeap;
 
 // 2. CPU 堆 (Per-CPU Heap)
@@ -166,13 +166,6 @@ static NvmAllocator* nvm_allocator_create_impl(void* nvm_base_addr, uint64_t nvm
     // --- 1. 初始化中心堆 ---
     allocator->central_heap.nvm_base_addr = nvm_base_addr;
 
-    // 初始化中心大锁
-    if (NVM_MUTEX_INIT(&allocator->central_heap.global_lock) != 0) {
-        fprintf(stderr, "ERROR: [nvm_allocator_create_impl] Failed to initialize global mutex.\n");
-        free(allocator);
-        return NULL;
-    }
-
     // 创建底层组件
     allocator->central_heap.space_manager = space_manager_create(nvm_size_bytes, NVM_START_OFFSET);
     allocator->central_heap.slab_lookup_table = slab_hashtable_create(INITIAL_HASHTABLE_CAPACITY);
@@ -182,7 +175,6 @@ static NvmAllocator* nvm_allocator_create_impl(void* nvm_base_addr, uint64_t nvm
         fprintf(stderr, "ERROR: [nvm_allocator_create_impl] Failed to create space_manager or slab_lookup_table.\n");
         if (allocator->central_heap.space_manager) space_manager_destroy(allocator->central_heap.space_manager);
         if (allocator->central_heap.slab_lookup_table) slab_hashtable_destroy(allocator->central_heap.slab_lookup_table);
-        NVM_MUTEX_DESTROY(&allocator->central_heap.global_lock);
         free(allocator);
         return NULL;
     }
@@ -217,9 +209,6 @@ static void nvm_allocator_destroy_impl(NvmAllocator* allocator) {
     // 2. 销毁中心堆组件
     space_manager_destroy(allocator->central_heap.space_manager);
     slab_hashtable_destroy(allocator->central_heap.slab_lookup_table);
-    
-    // 销毁锁
-    NVM_MUTEX_DESTROY(&allocator->central_heap.global_lock);
  
     // 3. 释放分配器自身
     free(allocator);
@@ -254,16 +243,12 @@ static void* nvm_malloc_impl(NvmAllocator* allocator, size_t size) {
     // 4. [慢速路径] 未找到可用 Slab，需要向中心堆申请
     if (target_slab == NULL) {
         
-        // --- 进入临界区 (中心大锁) ---
-        NVM_MUTEX_ACQUIRE(&allocator->central_heap.global_lock);
-
         // 4.1 申请 NVM 空间
         uint64_t new_slab_offset = space_manager_alloc_slab(allocator->central_heap.space_manager);
         
         if (new_slab_offset == (uint64_t)-1) {
             // NVM 空间耗尽
-            NVM_MUTEX_RELEASE(&allocator->central_heap.global_lock);
-            fprintf(stderr, "ERROR: [nvm_malloc_impl] NVM space exhausted.\n");
+            // fprintf(stderr, "ERROR: [nvm_malloc_impl] NVM space exhausted.\n");
             return NULL; 
         }
 
@@ -273,7 +258,6 @@ static void* nvm_malloc_impl(NvmAllocator* allocator, size_t size) {
         target_slab = nvm_slab_create(sc_id, new_slab_offset);
         if (target_slab == NULL) {
             space_manager_free_slab(allocator->central_heap.space_manager, new_slab_offset);
-            NVM_MUTEX_RELEASE(&allocator->central_heap.global_lock);
             fprintf(stderr, "ERROR: [nvm_malloc_impl] Failed to create slab metadata.\n");
             return NULL;
         }
@@ -282,13 +266,9 @@ static void* nvm_malloc_impl(NvmAllocator* allocator, size_t size) {
         if (slab_hashtable_insert(allocator->central_heap.slab_lookup_table, new_slab_offset, target_slab) != 0) {
             nvm_slab_destroy(target_slab);
             space_manager_free_slab(allocator->central_heap.space_manager, new_slab_offset);
-            NVM_MUTEX_RELEASE(&allocator->central_heap.global_lock);
             fprintf(stderr, "ERROR: [nvm_malloc_impl] Failed to insert slab into hashtable.\n");
             return NULL;
         }
-
-        // --- 离开临界区 ---
-        NVM_MUTEX_RELEASE(&allocator->central_heap.global_lock);
 
         // 4.4 将新 Slab 挂载到当前 CPU 堆的链表头部
         // (这是 CPU 私有操作，无需加锁)
@@ -319,13 +299,9 @@ static void nvm_free_impl(NvmAllocator* allocator, void* nvm_ptr) {
 
     // 2. [全局查表] 查找 Slab 元数据
     // 注意：Hash 表是全局共享的，读写都需要加锁保护
-    NVM_MUTEX_ACQUIRE(&allocator->central_heap.global_lock);
     NvmSlab* target_slab = slab_hashtable_lookup(allocator->central_heap.slab_lookup_table, slab_base_offset);
-    NVM_MUTEX_RELEASE(&allocator->central_heap.global_lock);
 
     if (target_slab == NULL) {
-        // 这是一个严重错误，通常意味着释放了野指针或未被管理的地址
-        // 在生产环境中可能需要 assert 或 log
         // assert(!"Attempting to free an unmanaged memory offset!");
         return;
     }
@@ -334,31 +310,6 @@ static void nvm_free_impl(NvmAllocator* allocator, void* nvm_ptr) {
     // nvm_slab_free 内部持有自旋锁，保证位图和缓存的一致性
     uint32_t block_idx = (nvm_offset - target_slab->nvm_base_offset) / target_slab->block_size;
     nvm_slab_free(target_slab, block_idx);
-
-    /*
-     * [并发改造关键点 - Slab 回收策略]
-     * 
-     * 在单线程版本中，如果 nvm_slab_is_empty(target_slab) 为真，我们会立即：
-     * 1. 从链表中移除 Slab
-     * 2. 从哈希表中移除 Slab
-     * 3. 归还 SpaceManager
-     * 4. 销毁 Slab 元数据
-     * 
-     * 在多线程版本中，Slab 属于某个 CPU 的私有链表 (cpu_heaps[X].slab_lists)。
-     * 如果当前线程不是 CPU X (即发生了 Remote Free)，我们无法安全地操作 CPU X 的链表
-     * (除非给每个 CPU 链表也加锁，但这会增加 malloc 的开销)。
-     * 
-     * 策略：延迟回收 (Deferred Reclaim)
-     * - 即使 Slab 全空了，我们也不将其从链表中移除，也不销毁。
-     * - 它依然挂在 CPU X 的链表上。
-     * - 当 CPU X 下次调用 malloc 时，会遍历链表，发现这个 Slab 是空的，直接复用它。
-     * - 缺点：可能会占用一些 NVM 空间不释放。
-     * - 优点：无需复杂的跨 CPU 锁，性能最高，实现最简单。
-     * 
-     * 未来优化：可以引入“Slab 归还队列”，将空 Slab 推送给 Owner CPU。
-     */
-     
-     // 目前：什么都不做。
 }
 
 

@@ -33,6 +33,9 @@ static inline int NVM_GET_CURRENT_CPU_ID() {
 #endif
 }
 
+// 缓存行大小
+#define CACHE_LINE_SIZE 64 // 或 128，取决于你的 CPU 架构
+
 // ============================================================================
 // 2. 锁的原语封装 (OSAL)
 // ============================================================================
@@ -54,7 +57,16 @@ typedef pthread_mutex_t nvm_mutex_t;
 #define NVM_MUTEX_DESTROY(l)    pthread_mutex_destroy(l)
 #define NVM_MUTEX_ACQUIRE(l)    pthread_mutex_lock(l)
 #define NVM_MUTEX_RELEASE(l)    pthread_mutex_unlock(l)
+// ... (保留之前的代码)
 
-#define CACHE_LINE_SIZE 64 // 或 128，取决于你的 CPU 架构
+// --- 类型 C: 读写锁 (RWLock) ---
+// 适用场景: 读多写少的数据结构 (如全局 Slab 哈希表)
+typedef pthread_rwlock_t nvm_rwlock_t;
+
+#define NVM_RWLOCK_INIT(l)      pthread_rwlock_init(l, NULL)
+#define NVM_RWLOCK_DESTROY(l)   pthread_rwlock_destroy(l)
+#define NVM_RWLOCK_READ_LOCK(l) pthread_rwlock_rdlock(l)  // 获取读锁
+#define NVM_RWLOCK_WRITE_LOCK(l) pthread_rwlock_wrlock(l) // 获取写锁
+#define NVM_RWLOCK_UNLOCK(l)    pthread_rwlock_unlock(l)  // 释放锁 (读或写)
 
 #endif // NVM_CONFIG_H

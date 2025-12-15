@@ -20,6 +20,7 @@ typedef struct FreeSegmentNode {
 typedef struct FreeSpaceManager {
     FreeSegmentNode* head;
     FreeSegmentNode* tail;
+    nvm_mutex_t lock; 
 } FreeSpaceManager;
 
 
@@ -45,6 +46,12 @@ FreeSpaceManager* space_manager_create(uint64_t total_nvm_size, uint64_t nvm_sta
     }
     manager->head = NULL;
     manager->tail = NULL;
+
+    // 初始化锁
+    if (NVM_MUTEX_INIT(&manager->lock) != 0) {
+        free(manager);
+        return NULL;
+    }
 
     // 验证NVM总大小是否有效
     if (total_nvm_size < NVM_SLAB_SIZE) {
@@ -83,6 +90,8 @@ void space_manager_destroy(FreeSpaceManager* manager) {
         free(node_to_free);
     }
     
+    // 销毁互斥锁
+    NVM_MUTEX_DESTROY(&manager->lock);
     // 释放管理器自身
     free(manager);
 }
@@ -92,6 +101,9 @@ uint64_t space_manager_alloc_slab(FreeSpaceManager* manager) {
     if (manager == NULL) {
         return (uint64_t)-1;
     }
+
+    // --- 自动加锁 ---
+    NVM_MUTEX_ACQUIRE(&manager->lock);
 
     // 遍历链表，查找第一个足够大的空闲块 (First-Fit策略)
     FreeSegmentNode* current = manager->head;
@@ -110,12 +122,14 @@ uint64_t space_manager_alloc_slab(FreeSpaceManager* manager) {
                 current->size -= NVM_SLAB_SIZE;
             }
 
+            NVM_MUTEX_RELEASE(&manager->lock); 
             return allocated_offset;
         }
         current = current->next;
     }
 
-    fprintf(stderr, "ERROR: [space_manager_alloc_slab] Out of memory. No free segment large enough to fit a slab.\n");
+    // fprintf(stderr, "ERROR: [space_manager_alloc_slab] Out of memory. No free segment large enough to fit a slab.\n");
+    NVM_MUTEX_RELEASE(&manager->lock);
     return (uint64_t)-1;
 }
 
@@ -124,6 +138,8 @@ void space_manager_free_slab(FreeSpaceManager* manager, uint64_t offset_to_free)
     if (manager == NULL) {
         return;
     }
+
+    NVM_MUTEX_ACQUIRE(&manager->lock);
 
     // 遍历链表，找到新块的正确插入位置 (prev_node 和 next_node)
     FreeSegmentNode* prev_node = NULL;
@@ -162,6 +178,8 @@ void space_manager_free_slab(FreeSpaceManager* manager, uint64_t offset_to_free)
         }
         insert_node_into_list(manager, new_node, prev_node, next_node);
     }
+
+    NVM_MUTEX_RELEASE(&manager->lock);
 }
 
 

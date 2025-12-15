@@ -15,6 +15,7 @@ typedef struct SlabHashTable {
     SlabHashNode** buckets;      // 哈希桶数组 (指针数组)
     uint32_t       capacity;     // 哈希桶数组的容量
     uint32_t       count;        // 当前存储的元素总数
+    nvm_rwlock_t   lock;
 } SlabHashTable;
 
 
@@ -50,6 +51,14 @@ SlabHashTable* slab_hashtable_create(uint32_t initial_capacity) {
         return NULL;
     }
 
+    // 初始化读写锁
+    if (NVM_RWLOCK_INIT(&table->lock) != 0) {
+        fprintf(stderr, "ERROR [HashTable]: Failed to initialize rwlock.\n");
+        free(table->buckets);
+        free(table);
+        return NULL;
+    }
+
     table->capacity = initial_capacity;
     table->count = 0;
     return table;
@@ -69,6 +78,9 @@ void slab_hashtable_destroy(SlabHashTable* table) {
             free(node_to_free);
         }
     }
+
+    NVM_RWLOCK_DESTROY(&table->lock);
+
     free(table->buckets);
     free(table);
 }
@@ -79,6 +91,8 @@ int slab_hashtable_insert(SlabHashTable* table, uint64_t nvm_offset, NvmSlab* sl
         fprintf(stderr, "ERROR [HashTable]: Insert failed due to NULL table or slab_ptr argument.\n");
         return -1;
     }
+
+    NVM_RWLOCK_WRITE_LOCK(&table->lock);
     
     uint32_t bucket_index = hash_function(table, nvm_offset);
 
@@ -87,6 +101,7 @@ int slab_hashtable_insert(SlabHashTable* table, uint64_t nvm_offset, NvmSlab* sl
     while (current_node != NULL) {
         if (current_node->nvm_offset == nvm_offset) {
             fprintf(stderr, "ERROR [HashTable]: Insert failed. Key %llu already exists in the hash table.\n", (unsigned long long)nvm_offset);
+            NVM_RWLOCK_UNLOCK(&table->lock);
             return -1; // 键已存在
         }
         current_node = current_node->next;
@@ -96,12 +111,14 @@ int slab_hashtable_insert(SlabHashTable* table, uint64_t nvm_offset, NvmSlab* sl
     SlabHashNode* new_node = create_hash_node(nvm_offset, slab_ptr);
     if (new_node == NULL) {
         fprintf(stderr, "ERROR [HashTable]: Insert failed. Could not create hash node (host memory exhausted).\n");
+        NVM_RWLOCK_UNLOCK(&table->lock);
         return -1; // 内存不足
     }
     new_node->next = table->buckets[bucket_index];
     table->buckets[bucket_index] = new_node;
 
     table->count++;
+    NVM_RWLOCK_UNLOCK(&table->lock);
     return 0;
 }
 
@@ -111,17 +128,22 @@ NvmSlab* slab_hashtable_lookup(SlabHashTable* table, uint64_t nvm_offset) {
         return NULL;
     }
 
+    NVM_RWLOCK_READ_LOCK(&table->lock);
+
     uint32_t bucket_index = hash_function(table, nvm_offset);
 
     // 遍历冲突链查找匹配的键
     SlabHashNode* current_node = table->buckets[bucket_index];
     while (current_node != NULL) {
         if (current_node->nvm_offset == nvm_offset) {
-            return current_node->slab_ptr; // 找到匹配项
+            NvmSlab* result = current_node->slab_ptr;
+            NVM_RWLOCK_UNLOCK(&table->lock);
+            return result; 
         }
         current_node = current_node->next;
     }
 
+    NVM_RWLOCK_UNLOCK(&table->lock);
     return NULL; // 未找到
 }
 
@@ -131,6 +153,7 @@ NvmSlab* slab_hashtable_remove(SlabHashTable* table, uint64_t nvm_offset) {
         return NULL;
     }
 
+    NVM_RWLOCK_WRITE_LOCK(&table->lock);
     uint32_t bucket_index = hash_function(table, nvm_offset);
 
     // 遍历冲突链，查找要删除的节点
@@ -149,6 +172,8 @@ NvmSlab* slab_hashtable_remove(SlabHashTable* table, uint64_t nvm_offset) {
             NvmSlab* slab_to_return = current_node->slab_ptr;
             free(current_node);
             table->count--;
+
+            NVM_RWLOCK_UNLOCK(&table->lock);
             return slab_to_return;
         }
         
@@ -157,6 +182,8 @@ NvmSlab* slab_hashtable_remove(SlabHashTable* table, uint64_t nvm_offset) {
     }
 
     fprintf(stderr, "WARN [HashTable]: Attempted to remove non-existent key %llu.\n", (unsigned long long)nvm_offset);
+
+    NVM_RWLOCK_UNLOCK(&table->lock);
     return NULL; // 未找到
 }
 
