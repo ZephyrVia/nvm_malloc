@@ -6,6 +6,8 @@
 #include <stdbool.h>
 #include <stdio.h> 
 
+#include "NvmConfig.h" 
+
 #define NVM_START_OFFSET  0
 
 #define NVM_SLAB_SIZE (2 * 1024 * 1024)  // 每个Slab的大小 (2MB)

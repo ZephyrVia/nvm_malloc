@@ -5,6 +5,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(my_project VERSION 1.0.0 LANGUAGES C)
 
+# 开启 GNU 扩展，确定 sched_getcpu 可用
+add_definitions(-D_GNU_SOURCE)
 
 # 2. 全局设置
 #------------------------------------------------
